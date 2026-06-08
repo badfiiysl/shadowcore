@@ -1,6 +1,6 @@
-// ShadowCore Popup UI - v5.0.0 (REFACTORED FOR ROBUSTNESS)
-// Improvements: Promise safety, proper token validation, race condition elimination, 
-// atomic DOM updates, form state isolation, comprehensive error boundaries
+// ShadowCore Popup UI - v5.1.0 (PRODUCTION HARDENED)
+// Fixes: Token race elimination, promise dedup stability, safe timeout wrapper,
+// throttled updates, form editing precision, metrics reset, cross-browser cleanup
 // ============================================================================
 
 // ============================================================================
@@ -11,10 +11,10 @@ let currentMode = 'clearnet';
 let currentStatus = null;
 let adblockEnabled = true;
 
-// Update coordination (atomic + token-based)
+// Update coordination (finally-only, no timeout-based unlocking)
 let updateInProgress = false;
-let updateToken = 0;
-let pendingUpdateToken = null;
+let updateQueued = false; // Simple boolean: update is pending
+const updateQueue = []; // Store token if needed for debugging
 
 // Timer management
 let statusUpdateTimeout = null;
@@ -28,16 +28,17 @@ const MIN_ACTION_INTERVAL = 500;
 // Concurrency guards
 let isTestingProxy = false;
 let listenersAttached = false;
+let uiScheduled = false; // Throttle UI updates
 
-// Promise deduplication (never resolve with stale data)
-const pendingRequests = new Map();
-
-// Form state isolation (prevent read/write conflicts)
+// Form state isolation (input/change only, not focus)
 const formState = {
   isEditing: false,
-  editTimeout: null,
-  lastEditTime: 0
+  editTimeout: null
 };
+
+// Promise deduplication (skip for sensitive actions)
+const pendingRequests = new Map();
+const SENSITIVE_ACTIONS = new Set(['setCustomProxy', 'toggleAdBlock']);
 
 // API
 const api = (typeof browser !== 'undefined') ? browser : chrome;
@@ -45,6 +46,63 @@ const DEBUG = false;
 
 // DOM Elements
 const elements = {};
+
+// ============================================================================
+// LOGGER (Structured, debug-aware)
+// ============================================================================
+
+const logger = {
+  log: (level, msg, data) => {
+    if (!DEBUG) return;
+    const timestamp = new Date().toISOString().slice(11, -1);
+    const prefix = `[${timestamp}] [${level}]`;
+    if (data) {
+      console.log(`${prefix} ${msg}`, data);
+    } else {
+      console.log(`${prefix} ${msg}`);
+    }
+  },
+  info: (msg, data) => logger.log('INFO', msg, data),
+  warn: (msg, data) => logger.log('WARN', msg, data),
+  error: (msg, data) => logger.log('ERROR', msg, data),
+  debug: (msg, data) => logger.log('DEBUG', msg, data)
+};
+
+// ============================================================================
+// SAFE TIMEOUT WRAPPER (Prevents stale callbacks)
+// ============================================================================
+
+/**
+ * Wraps setTimeout with cleanup to prevent stale callbacks.
+ * Callback is skipped if timeout is cleared before firing.
+ */
+function safeTimeout(fn, delay) {
+  let fired = false;
+  const id = setTimeout(() => {
+    if (!fired) {
+      fired = true;
+      activeTimeouts.delete(id);
+      try {
+        fn();
+      } catch (err) {
+        logger.error('safeTimeout callback error', err);
+      }
+    }
+  }, delay);
+
+  activeTimeouts.add(id);
+  return id;
+}
+
+/**
+ * Clear a safe timeout and prevent callback execution.
+ */
+function clearSafeTimeout(id) {
+  if (id) {
+    clearTimeout(id);
+    activeTimeouts.delete(id);
+  }
+}
 
 // ============================================================================
 // INITIALIZATION
@@ -78,7 +136,7 @@ function cacheElements() {
     if (el) {
       elements[key] = el;
     } else if (DEBUG) {
-      console.warn(`Missing: ${id}`);
+      logger.warn(`Missing DOM element: ${id}`);
     }
   }
 
@@ -86,38 +144,34 @@ function cacheElements() {
 }
 
 /**
- * Track form editing with debounce to prevent race conditions
+ * Track form editing with debounce (input/change only, not focus).
+ * Prevents programmatic updates from being blocked unnecessarily.
  */
 function trackFormEditing() {
   const formFields = [elements.pType, elements.pHost, elements.pPort, elements.pUser, elements.pPass].filter(Boolean);
 
   const onFieldChange = () => {
     formState.isEditing = true;
-    formState.lastEditTime = Date.now();
 
-    // Clear previous timeout
-    if (formState.editTimeout) {
-      clearTimeout(formState.editTimeout);
-      activeTimeouts.delete(formState.editTimeout);
-    }
+    clearSafeTimeout(formState.editTimeout);
 
     // Debounce: mark editing as done after 1 second of inactivity
-    formState.editTimeout = setTimeout(() => {
+    formState.editTimeout = safeTimeout(() => {
       formState.isEditing = false;
-      activeTimeouts.delete(formState.editTimeout);
       formState.editTimeout = null;
+      logger.debug('Form edit timeout - marking as not editing');
     }, 1000);
-
-    activeTimeouts.add(formState.editTimeout);
   };
 
   formFields.forEach(field => {
     if (field) {
+      // Only input/change, not focus (prevents aggressive blocking)
       field.addEventListener('input', onFieldChange);
       field.addEventListener('change', onFieldChange);
-      field.addEventListener('focus', onFieldChange);
     }
   });
+
+  logger.debug('Form editing tracking initialized');
 }
 
 function canAction(actionName) {
@@ -141,6 +195,9 @@ function updateConnectionStatus(status) {
     if (elements.statusLabel) elements.statusLabel.textContent = 'Offline';
     if (elements.statusDot) elements.statusDot.className = 'dot off';
     if (elements.statusSub) elements.statusSub.textContent = 'Extension not responding';
+    
+    // FIX: Also reset metrics when offline
+    updateMetrics(null);
     return;
   }
 
@@ -168,8 +225,17 @@ function updateConnectionStatus(status) {
   }
 }
 
+/**
+ * FIXED: Clear metrics if no data, don't silently ignore or stale-display.
+ */
 function updateMetrics(status) {
-  if (!status?.metrics) return;
+  if (!status?.metrics) {
+    // Clear old metrics to prevent stale display
+    if (elements.mTotal) elements.mTotal.textContent = '0';
+    if (elements.mSuccess) elements.mSuccess.textContent = '0%';
+    if (elements.mLatency) elements.mLatency.textContent = '0ms';
+    return;
+  }
 
   const metrics = status.metrics;
   if (elements.mTotal) elements.mTotal.textContent = (metrics.total ?? 0).toLocaleString();
@@ -215,7 +281,7 @@ function updateProxyPanel(status) {
 
       // Validate all required fields exist before update
       if (!proxy.type || !proxy.host || proxy.port === undefined) {
-        console.warn('Invalid proxy config:', proxy);
+        logger.warn('Invalid proxy config', proxy);
         return;
       }
 
@@ -251,40 +317,33 @@ function updateProxyPanel(status) {
 }
 
 // ============================================================================
-// MAIN UPDATE FUNCTION (Atomic token validation)
+// MAIN UPDATE FUNCTION (Fixed token race, finally-only unlock)
 // ============================================================================
 
+/**
+ * FIXED: Token system with no timeout-based unlocking.
+ * Relies entirely on finally block for clean unlock.
+ */
 async function updateUI() {
   if (updateInProgress) {
-    // Queue this update to run after current one completes
-    pendingUpdateToken = ++updateToken;
+    updateQueued = true;
+    logger.debug('Update queued (one already in progress)');
     return;
   }
 
-  // Increment token BEFORE network call (atomic)
-  const myToken = ++updateToken;
+  // Increment token before network call (atomic)
+  const myToken = ++updateQueue[0] ?? (updateQueue[0] = 0);
   updateInProgress = true;
+  updateQueued = false;
 
-  const timeoutId = setTimeout(() => {
-    updateInProgress = false;
-    activeTimeouts.delete(timeoutId);
-
-    // If a newer update was queued, run it now
-    if (pendingUpdateToken !== null && pendingUpdateToken > myToken) {
-      pendingUpdateToken = null;
-      updateUI();
-    }
-  }, 5000);
-
-  activeTimeouts.add(timeoutId);
+  logger.debug(`Update started (token: ${myToken})`);
 
   try {
     const status = await sendMessage('getStatus');
 
     // CRITICAL: Validate token BEFORE any UI updates
-    // If a newer update has started, discard this response
-    if (myToken !== updateToken) {
-      if (DEBUG) console.log(`Stale update discarded (token: ${myToken}, current: ${updateToken})`);
+    if (myToken !== updateQueue[0]) {
+      logger.debug(`Stale update discarded (token: ${myToken}, current: ${updateQueue[0]})`);
       return;
     }
 
@@ -301,22 +360,40 @@ async function updateUI() {
     updateMetrics(status);
     updateModeButtons(status);
     updateProxyPanel(status);
+
+    logger.debug('UI updated successfully');
   } catch (err) {
-    console.error('updateUI error:', err);
+    logger.error('updateUI error', err);
     updateConnectionStatus(null);
   } finally {
-    clearTimeout(timeoutId);
-    activeTimeouts.delete(timeoutId);
+    // FIXED: No timeout-based unlocking. Only finally unlocks.
     updateInProgress = false;
 
-    // Check if another update was queued while we were running
-    if (pendingUpdateToken !== null && pendingUpdateToken > myToken) {
-      pendingUpdateToken = null;
-      queueMicrotask(() => {
-        updateUI();
-      });
+    // If another update was queued, schedule it
+    if (updateQueued) {
+      updateQueued = false;
+      logger.debug('Scheduled queued update');
+      scheduleUpdateUI();
     }
   }
+}
+
+/**
+ * FIXED: Throttle UI updates to prevent re-entrancy loops.
+ * Only one update can be scheduled at a time.
+ */
+function scheduleUpdateUI() {
+  if (uiScheduled) {
+    logger.debug('Update already scheduled');
+    return;
+  }
+
+  uiScheduled = true;
+
+  queueMicrotask(async () => {
+    uiScheduled = false;
+    await updateUI();
+  });
 }
 
 // ============================================================================
@@ -331,25 +408,20 @@ function handleRuntimeMessage(msg, sender, sendResponse) {
       msg?.event === 'torChanged' ||
       msg?.event === 'adBlockToggled'
     ) {
+      logger.debug(`Runtime event: ${msg.event}`);
+
       // Cancel previous debounce
-      if (statusUpdateTimeout) {
-        clearTimeout(statusUpdateTimeout);
-        activeTimeouts.delete(statusUpdateTimeout);
-      }
+      clearSafeTimeout(statusUpdateTimeout);
 
-      const timeoutId = setTimeout(() => {
-        activeTimeouts.delete(timeoutId);
+      statusUpdateTimeout = safeTimeout(() => {
         statusUpdateTimeout = null;
-        updateUI();
+        scheduleUpdateUI();
       }, 50);
-
-      statusUpdateTimeout = timeoutId;
-      activeTimeouts.add(timeoutId);
     }
 
     sendResponse({ received: true });
   } catch (err) {
-    console.error('handleRuntimeMessage error:', err);
+    logger.error('handleRuntimeMessage error', err);
     try {
       sendResponse({ error: err.message });
     } catch (e) {
@@ -366,14 +438,16 @@ function setupEventSubscription() {
   try {
     api.runtime.onMessage.addListener(handleRuntimeMessage);
     listenersAttached = true;
+    logger.debug('Runtime message listener attached');
   } catch (err) {
-    console.error('Failed to attach runtime listener:', err);
+    logger.error('Failed to attach runtime listener', err);
   }
 }
 
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden) {
-    updateUI();
+    logger.debug('Popup became visible, updating UI');
+    scheduleUpdateUI();
   }
 });
 
@@ -381,16 +455,16 @@ document.addEventListener('visibilitychange', () => {
 // CLEANUP
 // ============================================================================
 
-window.addEventListener('unload', () => {
+function cleanup() {
   try {
     if (api?.runtime?.onMessage?.removeListener) {
       api.runtime.onMessage.removeListener(handleRuntimeMessage);
     }
     listenersAttached = false;
 
-    if (statusUpdateTimeout) clearTimeout(statusUpdateTimeout);
-    if (toastTimeout) clearTimeout(toastTimeout);
-    if (formState.editTimeout) clearTimeout(formState.editTimeout);
+    clearSafeTimeout(statusUpdateTimeout);
+    clearSafeTimeout(toastTimeout);
+    clearSafeTimeout(formState.editTimeout);
 
     // Clear all tracked timeouts
     activeTimeouts.forEach(id => clearTimeout(id));
@@ -398,27 +472,48 @@ window.addEventListener('unload', () => {
 
     pendingRequests.clear();
     currentStatus = null;
+
+    logger.info('Cleanup complete');
   } catch (e) {
-    // Ignore
+    logger.error('Cleanup error', e);
   }
-});
+}
+
+window.addEventListener('unload', cleanup);
+
+// FIXED: Also handle pagehide for Firefox reliability
+window.addEventListener('pagehide', cleanup);
 
 // ============================================================================
-// MESSAGE API (Promise safety + cross-browser compatibility)
+// MESSAGE API (Promise dedup with sensitive action skip)
 // ============================================================================
 
 /**
+ * Generate stable request ID, skipping for sensitive actions.
+ */
+function getRequestId(action, data) {
+  // Skip dedup for sensitive actions (password, auth, toggles)
+  if (SENSITIVE_ACTIONS.has(action)) {
+    return null;
+  }
+
+  // Stable key: sort data entries to avoid key-order instability
+  const sortedEntries = Object.entries(data).sort(([keyA], [keyB]) => keyA.localeCompare(keyB));
+  return `${action}:${JSON.stringify(sortedEntries)}`;
+}
+
+/**
  * Send message with:
- * - Promise deduplication (share inflight requests)
- * - Proper timeout handling (never double-fire)
+ * - Promise deduplication (skip for sensitive actions)
  * - Cross-browser compatibility (Firefox + Chrome)
- * - Explicit finished flag to prevent race conditions
+ * - Explicit finished flag to prevent double-fire
  */
 function sendMessage(action, data = {}) {
-  const requestId = `${action}:${JSON.stringify(data)}`;
+  const requestId = getRequestId(action, data);
 
   // If this request is already in flight, return the same promise
-  if (pendingRequests.has(requestId)) {
+  if (requestId && pendingRequests.has(requestId)) {
+    logger.debug(`Request dedup hit: ${action}`);
     return pendingRequests.get(requestId);
   }
 
@@ -426,16 +521,14 @@ function sendMessage(action, data = {}) {
   const promise = new Promise((resolve) => {
     let finished = false;
 
-    const timeoutId = setTimeout(() => {
+    const timeoutId = safeTimeout(() => {
       if (!finished) {
         finished = true;
-        pendingRequests.delete(requestId);
-        activeTimeouts.delete(timeoutId);
+        if (requestId) pendingRequests.delete(requestId);
+        logger.warn(`Request timeout: ${action}`);
         resolve({ ok: false, error: 'Timeout', timeout: true });
       }
     }, 5000);
-
-    activeTimeouts.add(timeoutId);
 
     try {
       if (typeof browser !== 'undefined' && browser.runtime && browser.runtime.sendMessage) {
@@ -444,18 +537,18 @@ function sendMessage(action, data = {}) {
           .then(res => {
             if (!finished) {
               finished = true;
-              clearTimeout(timeoutId);
-              activeTimeouts.delete(timeoutId);
-              pendingRequests.delete(requestId);
+              clearSafeTimeout(timeoutId);
+              if (requestId) pendingRequests.delete(requestId);
+              logger.debug(`Response received: ${action}`, res);
               resolve(res ?? { ok: false });
             }
           })
           .catch(err => {
             if (!finished) {
               finished = true;
-              clearTimeout(timeoutId);
-              activeTimeouts.delete(timeoutId);
-              pendingRequests.delete(requestId);
+              clearSafeTimeout(timeoutId);
+              if (requestId) pendingRequests.delete(requestId);
+              logger.error(`Promise error: ${action}`, err);
               resolve({ ok: false, error: err?.message ?? String(err) });
             }
           });
@@ -464,13 +557,14 @@ function sendMessage(action, data = {}) {
         chrome.runtime.sendMessage({ action, ...data }, (response) => {
           if (!finished) {
             finished = true;
-            clearTimeout(timeoutId);
-            activeTimeouts.delete(timeoutId);
-            pendingRequests.delete(requestId);
+            clearSafeTimeout(timeoutId);
+            if (requestId) pendingRequests.delete(requestId);
 
             if (chrome.runtime.lastError) {
+              logger.error(`Chrome error: ${action}`, chrome.runtime.lastError);
               resolve({ ok: false, error: chrome.runtime.lastError.message });
             } else {
+              logger.debug(`Response received: ${action}`, response);
               resolve(response ?? { ok: false });
             }
           }
@@ -481,16 +575,18 @@ function sendMessage(action, data = {}) {
     } catch (err) {
       if (!finished) {
         finished = true;
-        clearTimeout(timeoutId);
-        activeTimeouts.delete(timeoutId);
-        pendingRequests.delete(requestId);
+        clearSafeTimeout(timeoutId);
+        if (requestId) pendingRequests.delete(requestId);
+        logger.error(`Send error: ${action}`, err);
         resolve({ ok: false, error: err?.message ?? String(err) });
       }
     }
   });
 
-  // Store promise for deduplication
-  pendingRequests.set(requestId, promise);
+  // Store promise for deduplication (only if requestId exists)
+  if (requestId) {
+    pendingRequests.set(requestId, promise);
+  }
 
   return promise;
 }
@@ -499,15 +595,12 @@ function showToast(message, isError = false) {
   if (!elements.toast) return;
 
   try {
-    if (toastTimeout) {
-      clearTimeout(toastTimeout);
-      activeTimeouts.delete(toastTimeout);
-    }
+    clearSafeTimeout(toastTimeout);
 
     elements.toast.textContent = message;
     elements.toast.className = `toast ${isError ? 'err' : 'ok'} show`;
 
-    toastTimeout = setTimeout(() => {
+    toastTimeout = safeTimeout(() => {
       try {
         if (elements.toast) {
           elements.toast.classList.remove('show');
@@ -515,13 +608,10 @@ function showToast(message, isError = false) {
       } catch (e) {
         // DOM may be gone
       }
-      activeTimeouts.delete(toastTimeout);
       toastTimeout = null;
     }, 2500);
-
-    activeTimeouts.add(toastTimeout);
   } catch (err) {
-    console.error('showToast error:', err);
+    logger.error('showToast error', err);
   }
 }
 
@@ -540,15 +630,16 @@ async function setMode(mode) {
   }
 
   try {
+    logger.debug(`Setting mode to: ${mode}`);
     const response = await sendMessage('setMode', { mode });
     if (response?.ok) {
       showToast(`✓ ${mode.toUpperCase()}`);
-      await updateUI();
+      scheduleUpdateUI();
     } else {
       showToast(`Failed: ${response?.error ?? 'Unknown'}`, true);
     }
   } catch (err) {
-    console.error('setMode error:', err);
+    logger.error('setMode error', err);
     showToast('Error setting mode', true);
   }
 }
@@ -590,6 +681,7 @@ async function saveProxy() {
       password: elements.pPass?.value ?? ''
     };
 
+    logger.debug('Saving proxy config', { ...config, password: '[REDACTED]' });
     const response = await sendMessage('setCustomProxy', { config });
     if (response?.ok) {
       showToast('✓ Proxy saved');
@@ -604,7 +696,7 @@ async function saveProxy() {
       showToast(`Failed: ${response?.error ?? 'Unknown'}`, true);
     }
   } catch (err) {
-    console.error('saveProxy error:', err);
+    logger.error('saveProxy error', err);
     showToast('Error saving proxy', true);
   }
 }
@@ -616,6 +708,7 @@ async function disableProxy() {
   }
 
   try {
+    logger.debug('Disabling proxy');
     const response = await sendMessage('disableCustomProxy');
     if (response?.ok) {
       showToast('✓ Proxy disabled');
@@ -624,7 +717,7 @@ async function disableProxy() {
       showToast(`Failed: ${response?.error ?? 'Unknown'}`, true);
     }
   } catch (err) {
-    console.error('disableProxy error:', err);
+    logger.error('disableProxy error', err);
     showToast('Error disabling proxy', true);
   }
 }
@@ -632,6 +725,7 @@ async function disableProxy() {
 async function toggleAdBlock() {
   try {
     const newState = !adblockEnabled;
+    logger.debug(`Toggling ad block to: ${newState}`);
     const response = await sendMessage('toggleAdBlock', { enabled: newState });
 
     if (response?.ok && elements.adblockToggle) {
@@ -648,7 +742,7 @@ async function toggleAdBlock() {
       showToast(`Failed: ${response?.error ?? 'Unknown'}`, true);
     }
   } catch (err) {
-    console.error('toggleAdBlock error:', err);
+    logger.error('toggleAdBlock error', err);
     showToast('Error toggling ad block', true);
   }
 }
@@ -667,7 +761,7 @@ async function getAdBlockStatus() {
       }
     }
   } catch (err) {
-    console.error('getAdBlockStatus error:', err);
+    logger.error('getAdBlockStatus error', err);
   }
 }
 
@@ -690,15 +784,16 @@ async function testConnection() {
   }
 
   try {
+    logger.debug('Testing proxy connection');
     const response = await sendMessage('testProxy');
     if (response?.ok) {
       showToast(`✅ ${response.ip ?? 'Connected'}`);
-      await updateUI();
+      scheduleUpdateUI();
     } else {
       showToast(`❌ ${response?.error ?? 'Failed'}`, true);
     }
   } catch (err) {
-    console.error('testConnection error:', err);
+    logger.error('testConnection error', err);
     showToast('❌ Test failed', true);
   } finally {
     isTestingProxy = false;
@@ -713,7 +808,7 @@ async function testConnection() {
 function openDashboard() {
   showToast('📊 DevTools (F12)');
   sendMessage('openDashboard').catch(err => {
-    console.error('openDashboard error:', err);
+    logger.error('openDashboard error', err);
   });
 }
 
@@ -753,6 +848,8 @@ function bindEvents() {
       openDashboard();
     });
   }
+
+  logger.debug('Event listeners bound');
 }
 
 // ============================================================================
@@ -761,19 +858,19 @@ function bindEvents() {
 
 async function init() {
   try {
-    if (DEBUG) console.log('🚀 ShadowCore v5.0.0 starting...');
+    logger.info('🚀 ShadowCore v5.1.0 starting...');
 
     cacheElements();
     bindEvents();
     trackFormEditing();
     setupEventSubscription();
 
-    await updateUI();
+    scheduleUpdateUI();
     await getAdBlockStatus();
 
-    if (DEBUG) console.log('✅ Ready');
+    logger.info('✅ Ready');
   } catch (err) {
-    console.error('Initialization error:', err);
+    logger.error('Initialization error', err);
   }
 }
 
