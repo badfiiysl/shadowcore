@@ -1,5 +1,5 @@
-// ShadowCore Popup UI - v5.8.0 (REACTIVE WITH DEPENDENCY TRACKING)
-// Fixes: selector IDs, stable memoization, render lock, dependency map
+// ShadowCore Popup UI - v6.0.0 (PRODUCTION REACTIVE - ALL CRITICAL FIXES)
+// Dirty selector tracking, server-authoritative versioning, proper cleanup, strict contracts
 // ============================================================================
 
 // ============================================================================
@@ -76,7 +76,7 @@ function sendMessage(action, data = {}) {
 }
 
 // ============================================================================
-// LAYER 2: CORE STATE (Immutable)
+// LAYER 2: CORE STATE (Immutable, server-authoritative)
 // ============================================================================
 
 const DEFAULT_STATE = {
@@ -98,16 +98,19 @@ const DEFAULT_STATE = {
 };
 
 let coreState = { ...DEFAULT_STATE };
-let ephemeralState = { isEditing: false, editingUntil: 0 };
+let ephemeralState = { editingUntil: 0 }; // FIX 4: timestamp only, not boolean
 let currentGeneration = 0;
 let updateInProgress = false;
 let pendingUpdates = 0;
 
+// FIX 6: Track dirty selectors for reactive rendering
+const dirtySelectors = new Set();
+
 // ============================================================================
-// LAYER 3: SELECTORS WITH STABLE IDs (FIX 2)
+// LAYER 3: SELECTORS WITH STRICT CONTRACT (FIX 1)
 // ============================================================================
 
-// FIX 2: Stable selector IDs - no function identity issues
+// FIX 1: Enforce strict contract - all selectors are objects with id + fn
 const Selectors = {
   mode: { id: 'mode', fn: (s) => s.mode },
   online: { id: 'online', fn: (s) => s.online },
@@ -126,84 +129,90 @@ const Selectors = {
   isClearnetMode: { id: 'isClearnetMode', fn: (s) => s.mode === 'clearnet' }
 };
 
-// FIX 2: Stable memoization by selector ID + version
-const memoCache = new Map();
-
-function getSelectorValue(selector, state, ephemState) {
-  const cacheKey = `${selector.id}:${state._version}:${ephemState.isEditing}`;
-  
-  if (memoCache.has(cacheKey)) {
-    return memoCache.get(cacheKey);
+// Validate selector contract
+Object.values(Selectors).forEach(sel => {
+  if (!sel.id || typeof sel.fn !== 'function') {
+    throw new Error(`Invalid selector: ${JSON.stringify(sel)}`);
   }
+});
+
+// FIX 1 & 3: Enforce strict getter with timestamp-based memoization
+const get = (selector, state, ephem) => {
+  const cacheKey = `${selector.id}:${state._version}:${ephem.editingUntil}`;
+  const cached = memoCache.get(cacheKey);
+  if (cached !== undefined) return cached;
   
-  const value = selector.fn(state, ephemState);
+  const value = selector.fn(state, ephem);
   memoCache.set(cacheKey, value);
   
-  // Cleanup old cache entries periodically
-  if (memoCache.size > 100) {
-    const toDelete = Array.from(memoCache.keys()).slice(0, 50);
+  if (memoCache.size > MAX_CACHE_SIZE) {
+    const toDelete = Array.from(memoCache.keys()).slice(0, Math.floor(MAX_CACHE_SIZE / 2));
     toDelete.forEach(k => memoCache.delete(k));
   }
   
   return value;
-}
+};
+
+const memoCache = new Map();
+const MAX_CACHE_SIZE = 100;
 
 // ============================================================================
-// LAYER 4: DEPENDENCY MAP (FIX 1 & 5 - No broken diffing)
+// LAYER 4: DEPENDENCY MAP (One-concern elements)
 // ============================================================================
 
-// Each DOM element declares which selectors it depends on
 const dependencyMap = new Map();
 const elements = {};
+const eventListeners = []; // FIX 7: Track listeners for cleanup
 
 function registerDependency(element, selector, updateFn) {
   if (!element) return false;
   
   if (!dependencyMap.has(element)) {
-    dependencyMap.set(element, []);
+    dependencyMap.set(element, { selector, updateFn });
   }
-  dependencyMap.get(element).push({ selector, updateFn });
   return true;
 }
 
-// FIX 1: Clean dependency registration - no broken value comparison
 function buildDependencyMap() {
   dependencyMap.clear();
   
-  // Status elements
+  // FIX 5: One selector per element (single concern)
   registerDependency(elements.statusLabel, Selectors.connectionLabel, (el, val) => el.textContent = val);
   registerDependency(elements.statusSub, Selectors.connectionSubtext, (el, val) => el.textContent = val);
   registerDependency(elements.statusDot, Selectors.connectionDotClass, (el, val) => el.className = val);
   
-  // Metrics
   registerDependency(elements.mTotal, Selectors.metricsTotal, (el, val) => el.textContent = val);
   registerDependency(elements.mSuccess, Selectors.metricsSuccess, (el, val) => el.textContent = val);
   registerDependency(elements.mLatency, Selectors.metricsLatency, (el, val) => el.textContent = val);
   
-  // Mode indicator
   const modeNames = { clearnet: 'DIRECT', tor: 'TOR ACTIVE', custom: 'PROXY ACTIVE' };
   registerDependency(elements.modeIndicator, Selectors.mode, (el, val) => {
     el.textContent = modeNames[val] ?? 'UNKNOWN';
   });
   
-  // Mode buttons
-  if (elements.modeBtns?.length) {
-    elements.modeBtns.forEach(btn => {
-      const btnMode = btn?.dataset?.mode;
-      if (btnMode) {
-        registerDependency(btn, Selectors.mode, (el, val) => {
-          el.classList.toggle('active', val === btnMode);
-        });
-      }
-    });
-  }
-  
-  // Proxy panel visibility
   registerDependency(elements.proxyPanel, Selectors.isCustomMode, (el, val) => {
     el.classList.toggle('hidden', !val);
   });
   
-  // FIX 3: Proxy form fields with timestamp-based editing lock
+  // Mode buttons - register each separately
+  if (elements.modeBtns?.length) {
+    elements.modeBtns.forEach((btn, idx) => {
+      if (btn?.dataset?.mode) {
+        const btnMode = btn.dataset.mode;
+        const btnElement = btn;
+        // Create unique tracking for each button
+        if (!dependencyMap.has(btnElement)) {
+          dependencyMap.set(btnElement, { 
+            selector: Selectors.mode, 
+            updateFn: (el, val) => el.classList.toggle('active', val === btnMode),
+            buttonMode: btnMode
+          });
+        }
+      }
+    });
+  }
+  
+  // Form fields - only update if not currently editing
   registerDependency(elements.pType, Selectors.customProxyType, (el, val) => {
     if (Date.now() > ephemeralState.editingUntil && el.value !== val) el.value = val;
   });
@@ -213,6 +222,7 @@ function buildDependencyMap() {
   registerDependency(elements.pPort, Selectors.customProxyPort, (el, val) => {
     if (Date.now() > ephemeralState.editingUntil && el.value !== val) el.value = val;
   });
+  
   registerDependency(elements.pUser, Selectors.customProxyHasAuth, (el, val) => {
     el.placeholder = val ? '✓ Saved' : 'Username';
   });
@@ -222,27 +232,44 @@ function buildDependencyMap() {
 }
 
 // ============================================================================
-// LAYER 5: REACTIVE RENDER (Dependency-driven, no broken diffing)
+// LAYER 5: REACTIVE RENDER (FIX 2, 6 - Dirty tracking only)
 // ============================================================================
 
-// Track previous values to avoid unnecessary updates
 const previousValues = new Map();
 
 function renderState() {
-  for (const [element, dependencies] of dependencyMap) {
+  // FIX 6: Only render if selector is dirty OR first render
+  if (dirtySelectors.size === 0 && previousValues.size > 0) {
+    return; // Nothing changed, skip render
+  }
+  
+  for (const [element, dep] of dependencyMap) {
     if (!element || !element.isConnected) continue;
     
-    for (const { selector, updateFn } of dependencies) {
-      const newValue = getSelectorValue(selector, coreState, ephemeralState);
-      const cacheKey = `${selector.id}:${element.id || element.className || Math.random()}`;
-      const oldValue = previousValues.get(cacheKey);
-      
-      if (oldValue !== newValue) {
-        updateFn(element, newValue);
-        previousValues.set(cacheKey, newValue);
-      }
+    const { selector, updateFn } = dep;
+    
+    // FIX 6: Only render if dirty
+    if (previousValues.size > 0 && !dirtySelectors.has(selector.id)) {
+      continue;
+    }
+    
+    // FIX 1: Use strict getter
+    const newValue = get(selector, coreState, ephemeralState);
+    
+    // FIX 2: Cache key is stable, no selector object comparison
+    const elementKey = element.id || `${element.tagName}:${element.className}`;
+    const cacheKey = `${selector.id}:${elementKey}`;
+    const oldValue = previousValues.get(cacheKey);
+    
+    // FIX 2: Only update if value actually changed
+    if (oldValue !== newValue) {
+      updateFn(element, newValue);
+      previousValues.set(cacheKey, newValue);
     }
   }
+  
+  // FIX 6: Clear dirty set after render
+  dirtySelectors.clear();
 }
 
 // ============================================================================
@@ -260,7 +287,7 @@ function normalizeState(rawStatus) {
         dotClass: 'dot off',
         exitIp: null
       },
-      _version: (coreState._version || 0) + 1
+      _version: rawStatus?._version ?? 0
     };
   }
   
@@ -301,7 +328,7 @@ function normalizeState(rawStatus) {
       avgLatency: rawStatus.metrics?.avgLatency ?? '0ms'
     },
     customProxy: rawStatus.customProxy?.enabled ? { ...rawStatus.customProxy } : null,
-    _version: (coreState._version || 0) + 1
+    _version: rawStatus._version ?? 0  // FIX 8: Server version is authoritative
   };
 }
 
@@ -330,6 +357,22 @@ async function refreshState() {
     }
     
     const newCoreState = normalizeState(rawStatus);
+    
+    // FIX 6: Mark which selectors changed
+    if (coreState._version !== newCoreState._version) {
+      // Entire state changed, mark all dirty
+      Object.values(Selectors).forEach(sel => dirtySelectors.add(sel.id));
+    } else {
+      // Partial update - compare values to find dirty selectors
+      Object.entries(Selectors).forEach(([_, selector]) => {
+        const oldVal = get(selector, coreState, ephemeralState);
+        const newVal = get(selector, newCoreState, ephemeralState);
+        if (oldVal !== newVal) {
+          dirtySelectors.add(selector.id);
+        }
+      });
+    }
+    
     coreState = newCoreState;
     renderState();
     
@@ -361,10 +404,9 @@ function scheduleStateRefresh() {
 }
 
 // ============================================================================
-// LAYER 8: ACTIONS (With optimistic updates)
+// LAYER 8: ACTIONS (Server-authoritative versioning)
 // ============================================================================
 
-// FIX 6: Safe optimistic updates with reconciliation
 const Actions = {
   async setMode(mode) {
     if (!['clearnet', 'tor', 'custom'].includes(mode)) {
@@ -373,9 +415,10 @@ const Actions = {
     }
     if (!canAction('setMode')) return false;
     
-    // Optimistic update with snapshot for rollback
+    // FIX 8: Optimistic update doesn't mutate version - let server define it
     const oldState = { ...coreState };
-    coreState = { ...coreState, mode, _version: coreState._version + 1 };
+    coreState = { ...coreState, mode };
+    dirtySelectors.add('mode');
     renderState();
     
     const r = await sendMessage('setMode', { mode });
@@ -384,8 +427,8 @@ const Actions = {
       await refreshState();
       return true;
     }
-    // Rollback on failure
     coreState = oldState;
+    dirtySelectors.add('mode');
     renderState();
     showToast(`Failed: ${r?.error ?? 'Unknown'}`, true);
     return false;
@@ -478,11 +521,9 @@ const Actions = {
     }
   },
   
-  // FIX 7: AdBlock respects backend but enforces UI
   async toggleAdBlock() {
     const r = await sendMessage('getAdBlockStatus');
     if (r?.enabled === false) {
-      // Attempt to enable if backend has it disabled
       await sendMessage('toggleAdBlock', { enabled: true });
     }
     showToast('🔒 Ad blocking enforced');
@@ -507,7 +548,7 @@ const Actions = {
 let isTestingProxy = false;
 
 // ============================================================================
-// FORM EDITING TRACKING (FIX 3: Timestamp-based lock)
+// FORM EDITING TRACKING (FIX 4: Timestamp only)
 // ============================================================================
 
 function trackFormEditing() {
@@ -516,21 +557,24 @@ function trackFormEditing() {
   let editTimeout = null;
   
   const onFieldChange = () => {
-    // FIX 3: Timestamp-based editing lock
-    ephemeralState = {
-      ...ephemeralState,
-      isEditing: true,
-      editingUntil: Date.now() + 1000
-    };
+    // FIX 4: Use timestamp for all editing state
+    const now = Date.now();
+    ephemeralState = { editingUntil: now + 1000 };
+    
+    // Mark form fields as dirty
+    dirtySelectors.add('customProxyType');
+    dirtySelectors.add('customProxyHost');
+    dirtySelectors.add('customProxyPort');
+    dirtySelectors.add('customProxyHasAuth');
+    
     renderState();
     
     if (editTimeout) clearTimeout(editTimeout);
     editTimeout = setTimeout(() => {
-      ephemeralState = {
-        ...ephemeralState,
-        isEditing: false,
-        editingUntil: 0
-      };
+      ephemeralState = { editingUntil: 0 };
+      dirtySelectors.add('customProxyType');
+      dirtySelectors.add('customProxyHost');
+      dirtySelectors.add('customProxyPort');
       renderState();
       editTimeout = null;
     }, 1000);
@@ -559,7 +603,7 @@ function showToast(message, isError = false) {
 }
 
 // ============================================================================
-// ADBLOCK SYNC (FIX 7: Respects backend)
+// ADBLOCK SYNC
 // ============================================================================
 
 async function syncAdBlockStatus() {
@@ -577,7 +621,7 @@ async function syncAdBlockStatus() {
 }
 
 // ============================================================================
-// EVENT HANDLERS
+// EVENT HANDLERS (FIX 7: Track listener refs)
 // ============================================================================
 
 let statusUpdateTimeout = null;
@@ -604,6 +648,7 @@ function setupEventSubscription() {
   if (listenersAttached) return;
   try {
     api.runtime.onMessage.addListener(handleRuntimeMessage);
+    eventListeners.push({ type: 'runtime', handler: handleRuntimeMessage });
     listenersAttached = true;
   } catch (err) { if (DEBUG) console.error('Failed to attach listener', err); }
 }
@@ -635,37 +680,65 @@ function cacheElements() {
 
 function bindEvents() {
   elements.modeBtns?.forEach(btn => {
-    btn.addEventListener('click', () => {
+    const clickHandler = () => {
       const mode = btn?.dataset?.mode;
       if (mode) Actions.setMode(mode);
-    });
+    };
+    btn.addEventListener('click', clickHandler);
+    eventListeners.push({ type: 'click', element: btn, handler: clickHandler });
   });
-  elements.saveProxyBtn?.addEventListener('click', () => Actions.saveProxy());
-  elements.disableProxyBtn?.addEventListener('click', () => Actions.disableProxy());
-  elements.testBtn?.addEventListener('click', () => Actions.testConnection());
-  elements.adblockToggle?.addEventListener('click', () => Actions.toggleAdBlock());
-  elements.openDashboard?.addEventListener('click', (e) => {
+  
+  const saveHandler = () => Actions.saveProxy();
+  elements.saveProxyBtn?.addEventListener('click', saveHandler);
+  eventListeners.push({ type: 'click', element: elements.saveProxyBtn, handler: saveHandler });
+  
+  const disableHandler = () => Actions.disableProxy();
+  elements.disableProxyBtn?.addEventListener('click', disableHandler);
+  eventListeners.push({ type: 'click', element: elements.disableProxyBtn, handler: disableHandler });
+  
+  const testHandler = () => Actions.testConnection();
+  elements.testBtn?.addEventListener('click', testHandler);
+  eventListeners.push({ type: 'click', element: elements.testBtn, handler: testHandler });
+  
+  const adblockHandler = () => Actions.toggleAdBlock();
+  elements.adblockToggle?.addEventListener('click', adblockHandler);
+  eventListeners.push({ type: 'click', element: elements.adblockToggle, handler: adblockHandler });
+  
+  const dashboardHandler = (e) => {
     e.preventDefault();
     Actions.openDashboard();
-  });
+  };
+  elements.openDashboard?.addEventListener('click', dashboardHandler);
+  eventListeners.push({ type: 'click', element: elements.openDashboard, handler: dashboardHandler });
 }
 
 // ============================================================================
-// CLEANUP (FIX 4: Proper renderer cleanup)
+// CLEANUP (FIX 7: Proper listener detachment)
 // ============================================================================
 
 function cleanup() {
   try {
-    if (api?.runtime?.onMessage?.removeListener) {
-      api.runtime.onMessage.removeListener(handleRuntimeMessage);
-    }
+    // FIX 7: Detach all tracked listeners
+    eventListeners.forEach(({ type, element, handler }) => {
+      if (type === 'runtime') {
+        if (api?.runtime?.onMessage?.removeListener) {
+          api.runtime.onMessage.removeListener(handler);
+        }
+      } else if (element && handler) {
+        element.removeEventListener(type, handler);
+      }
+    });
+    eventListeners.length = 0;
+    
     listenersAttached = false;
     if (statusUpdateTimeout) clearTimeout(statusUpdateTimeout);
     if (toastTimeout) clearTimeout(toastTimeout);
+    
     pendingRequests.clear();
     dependencyMap.clear();
     memoCache.clear();
     previousValues.clear();
+    dirtySelectors.clear();
   } catch (e) {}
 }
 
@@ -702,8 +775,12 @@ async function init() {
     trackFormEditing();
     setupEventSubscription();
     await syncAdBlockStatus();
+    
+    // Initial render - mark all dirty
+    Object.values(Selectors).forEach(sel => dirtySelectors.add(sel.id));
     await Actions.refresh();
-    if (DEBUG) console.log('ShadowCore v5.8.0 ready');
+    
+    if (DEBUG) console.log('ShadowCore v6.0.0 ready');
   } catch (err) { if (DEBUG) console.error('Init error:', err); }
 }
 
