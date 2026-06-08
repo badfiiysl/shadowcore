@@ -1,5 +1,5 @@
-// ShadowCore Popup UI - v6.2.0 (PRODUCTION REACTIVE - FINAL)
-// Fully fixed: error boundaries, toast integration, visibility handling, validation
+// ShadowCore Popup UI - v6.3.0 (PRODUCTION REACTIVE - ALL REAL ISSUES FIXED)
+// Fixes: saveProxy nesting, adblock sync, visibility guard, memoization, selective render, version consistency
 // ============================================================================
 
 const api = (typeof browser !== 'undefined') ? browser : chrome;
@@ -81,17 +81,22 @@ let coreState = structuredClone(DEFAULT_STATE);
 let ephemeralState = { editingUntil: 0 };
 let currentGeneration = 0;
 
+// FIX 3: Visibility guard
+let refreshEnabled = false;
+
 // ============================================================================
-// LAYER 3: REACTIVE SYSTEM
+// LAYER 3: REACTIVE SYSTEM (FIX 5: selective render map)
 // ============================================================================
 
 const bindings = new Map();
+const selectorSubscribers = new Map(); // FIX 5: selector → [elements]
 const memo = new Map();
 const prev = new Map();
 const MAX_MEMO = 120;
 
 function get(selector, state, ephem) {
-  const isEditing = Date.now() < ephem.editingUntil;
+  // FIX 4: More stable memoization key - use boolean instead of timestamp
+  const isEditing = ephem.editingUntil > 0;
   const key = `${selector.id}:${state._version}:${isEditing}`;
 
   if (memo.has(key)) return memo.get(key);
@@ -111,11 +116,32 @@ function bind(element, selector, fn) {
   if (!element) return;
   if (!bindings.has(element)) bindings.set(element, []);
   bindings.get(element).push({ selector, fn });
+
+  // FIX 5: Track selector subscribers
+  if (!selectorSubscribers.has(selector.id)) {
+    selectorSubscribers.set(selector.id, new Set());
+  }
+  selectorSubscribers.get(selector.id).add(element);
 }
 
-function render() {
-  for (const [el, deps] of bindings) {
+// FIX 5: Render only affected elements (optional optimization)
+function renderSelective(changedSelectorIds = null) {
+  const elementsToRender = changedSelectorIds
+    ? new Set()
+    : new Set(bindings.keys());
+
+  if (changedSelectorIds) {
+    changedSelectorIds.forEach(selId => {
+      const subscribers = selectorSubscribers.get(selId);
+      if (subscribers) subscribers.forEach(el => elementsToRender.add(el));
+    });
+  }
+
+  for (const el of elementsToRender) {
     if (!el || !el.isConnected) continue;
+
+    const deps = bindings.get(el);
+    if (!deps) continue;
 
     for (const { selector, fn } of deps) {
       const value = get(selector, coreState, ephemeralState);
@@ -123,7 +149,6 @@ function render() {
 
       if (prev.get(key) === value) continue;
 
-      // FIX: Error boundary in render loop
       try {
         fn(el, value);
         prev.set(key, value);
@@ -132,6 +157,11 @@ function render() {
       }
     }
   }
+}
+
+// Wrapper for simplicity (full render still available)
+function render() {
+  renderSelective();
 }
 
 // ============================================================================
@@ -155,7 +185,7 @@ const Selectors = {
 };
 
 // ============================================================================
-// LAYER 5: NORMALIZATION
+// LAYER 5: NORMALIZATION (FIX 6: consistent version handling)
 // ============================================================================
 
 function normalize(raw) {
@@ -164,7 +194,7 @@ function normalize(raw) {
       ...DEFAULT_STATE,
       online: false,
       connectionStatus: { label: 'Offline', subtext: 'No response', dotClass: 'dot off', exitIp: null },
-      _version: coreState._version + 1
+      _version: raw?._version ?? 0
     };
   }
 
@@ -209,7 +239,7 @@ function normalize(raw) {
       port: raw.customProxy.port || 1080,
       hasAuth: !!(raw.customProxy.username || raw.customProxy.password)
     } : null,
-    _version: (coreState._version || 0) + 1
+    _version: raw._version ?? 0  // FIX 6: Always use server version as authoritative
   };
 }
 
@@ -230,15 +260,17 @@ let refreshInterval = null;
 function startAutoRefresh(intervalMs = 5000) {
   if (refreshInterval) clearInterval(refreshInterval);
   refreshInterval = setInterval(refresh, intervalMs);
+  refreshEnabled = true;  // FIX 3: Set guard
 }
 
 function stopAutoRefresh() {
   if (refreshInterval) clearInterval(refreshInterval);
   refreshInterval = null;
+  refreshEnabled = false;  // FIX 3: Clear guard
 }
 
 // ============================================================================
-// LAYER 7: ACTIONS (With toast integration)
+// LAYER 7: ACTIONS (With fixes)
 // ============================================================================
 
 const Actions = {
@@ -270,13 +302,14 @@ const Actions = {
     return true;
   },
 
+  // FIX 1: Clean saveProxy - no double nesting
   async saveProxy(config) {
     if (!canAction('saveProxy')) {
       showToast('Wait before retry', true);
       return false;
     }
 
-    const res = await sendMessage('setCustomProxy', { config });
+    const res = await sendMessage('setCustomProxy', config);  // No extra { config } wrapper
     if (!res?.ok) {
       showToast(`Failed: ${res?.error ?? 'Unknown'}`, true);
       return false;
@@ -318,6 +351,24 @@ const Actions = {
 
     showToast(`❌ ${res?.error ?? 'Test failed'}`, true);
     return false;
+  },
+
+  // FIX 2: Real adblock sync - backend + refresh
+  async toggleAdBlock() {
+    if (!canAction('toggleAdBlock')) {
+      showToast('Wait before retry', true);
+      return false;
+    }
+
+    const res = await sendMessage('toggleAdBlock', { enabled: true });
+    if (!res?.ok) {
+      showToast(`Failed: ${res?.error ?? 'Unknown'}`, true);
+      return false;
+    }
+
+    showToast('🔒 Ad blocking enforced');
+    await refresh();
+    return true;
   },
 
   refresh
@@ -433,7 +484,7 @@ function cacheElements() {
 }
 
 // ============================================================================
-// EVENT HANDLERS (With validation)
+// EVENT HANDLERS
 // ============================================================================
 
 function bindEvents() {
@@ -445,7 +496,7 @@ function bindEvents() {
     });
   });
 
-  // Save proxy - FIX: Port validation
+  // Save proxy - FIX 1: Clean config passing
   elements.saveProxyBtn?.addEventListener('click', async () => {
     const host = elements.pHost?.value?.trim();
     const portStr = elements.pPort?.value?.trim();
@@ -474,20 +525,22 @@ function bindEvents() {
   // Disable proxy
   elements.disableProxyBtn?.addEventListener('click', () => Actions.disableProxy());
 
-  // Test connection
+  // Test connection - FIX 7: Safe button label restoration
   elements.testBtn?.addEventListener('click', async () => {
-    const originalText = elements.testBtn.textContent;
+    const label = '🧪 Test';
     elements.testBtn.disabled = true;
     elements.testBtn.textContent = '⏳ Testing...';
+    elements.testBtn.dataset.original = label;
+
     await Actions.testConnection();
+
     elements.testBtn.disabled = false;
-    elements.testBtn.textContent = originalText;
+    elements.testBtn.textContent = elements.testBtn.dataset.original || label;
+    delete elements.testBtn.dataset.original;
   });
 
-  // Ad block (enforced)
-  elements.adblockToggle?.addEventListener('click', () => {
-    showToast('🔒 Ad blocking enforced');
-  });
+  // Ad block - FIX 2: Real sync
+  elements.adblockToggle?.addEventListener('click', () => Actions.toggleAdBlock());
 
   // Dashboard
   elements.openDashboard?.addEventListener('click', (e) => {
@@ -518,15 +571,18 @@ function showToast(message, isError = false) {
 }
 
 // ============================================================================
-// VISIBILITY HANDLING (FIX)
+// VISIBILITY HANDLING (FIX 3: Safe guard)
 // ============================================================================
 
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) {
     stopAutoRefresh();
   } else {
-    refresh();
-    startAutoRefresh(5000);
+    // Only restart if not already running
+    if (!refreshEnabled) {
+      refresh();
+      startAutoRefresh(5000);
+    }
   }
 });
 
@@ -537,6 +593,7 @@ document.addEventListener('visibilitychange', () => {
 function cleanup() {
   stopAutoRefresh();
   bindings.clear();
+  selectorSubscribers.clear();
   memo.clear();
   prev.clear();
   pendingRequests.clear();
@@ -557,7 +614,7 @@ async function init() {
   trackEditing([elements.pHost, elements.pPort, elements.pType]);
   await refresh();
   startAutoRefresh(5000);
-  if (DEBUG) console.log('ShadowCore v6.2.0 ready');
+  if (DEBUG) console.log('ShadowCore v6.3.0 ready');
 }
 
 if (document.readyState === 'loading') {
