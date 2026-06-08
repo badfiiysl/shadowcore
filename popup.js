@@ -1,5 +1,5 @@
-// ShadowCore Popup UI - v6.3.0 (PRODUCTION REACTIVE - ALL REAL ISSUES FIXED)
-// Fixes: saveProxy nesting, adblock sync, visibility guard, memoization, selective render, version consistency
+// ShadowCore Popup UI - v6.3.1 (PRODUCTION REACTIVE - OPTIMIZED)
+// Fixes: saveProxy nesting, adblock sync, visibility guard, memoization, selective render, version consistency, optimistic updates
 // ============================================================================
 
 const api = (typeof browser !== 'undefined') ? browser : chrome;
@@ -270,7 +270,7 @@ function stopAutoRefresh() {
 }
 
 // ============================================================================
-// LAYER 7: ACTIONS (With fixes)
+// LAYER 7: ACTIONS (With fixes + optimizations)
 // ============================================================================
 
 const Actions = {
@@ -302,21 +302,33 @@ const Actions = {
     return true;
   },
 
-  // FIX 1: Clean saveProxy - no double nesting
+  // FIX 1 + OPTIMIZATION: Clean saveProxy with optimistic update (1 network call)
   async saveProxy(config) {
     if (!canAction('saveProxy')) {
       showToast('Wait before retry', true);
       return false;
     }
 
-    const res = await sendMessage('setCustomProxy', config);  // No extra { config } wrapper
+    const res = await sendMessage('setCustomProxy', config);
     if (!res?.ok) {
       showToast(`Failed: ${res?.error ?? 'Unknown'}`, true);
       return false;
     }
 
+    // OPTIMIZATION: Optimistic update instead of refresh() (saves 1 network call)
+    coreState = {
+      ...coreState,
+      customProxy: {
+        type: config.type || 'socks5',
+        host: config.host || '',
+        port: config.port || 1080,
+        hasAuth: !!(config.username || config.password)
+      },
+      _version: coreState._version + 1
+    };
+    render();
+
     showToast('✓ Proxy saved');
-    await refresh();
     return true;
   },
 
@@ -332,8 +344,15 @@ const Actions = {
       return false;
     }
 
+    // OPTIMIZATION: Optimistic update
+    coreState = {
+      ...coreState,
+      customProxy: null,
+      _version: coreState._version + 1
+    };
+    render();
+
     showToast('✓ Proxy disabled');
-    await refresh();
     return true;
   },
 
@@ -614,7 +633,7 @@ async function init() {
   trackEditing([elements.pHost, elements.pPort, elements.pType]);
   await refresh();
   startAutoRefresh(5000);
-  if (DEBUG) console.log('ShadowCore v6.3.0 ready');
+  if (DEBUG) console.log('ShadowCore v6.3.1 ready');
 }
 
 if (document.readyState === 'loading') {
